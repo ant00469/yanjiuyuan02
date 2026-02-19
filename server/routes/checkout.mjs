@@ -13,11 +13,15 @@ const PRODUCT_NAME = "颜究院颜值分析";
 function getZpayConfig() {
   const pid = process.env.ZPAY_PID;
   const key = process.env.ZPAY_KEY;
-  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL;
-  if (!pid || !key || !baseUrl) {
+  // return_url：用户浏览器跳转目标（前端地址）
+  const frontendUrl = process.env.NEXT_PUBLIC_BASE_URL;
+  // notify_url：zpay 服务器回调地址（必须是公网可访问的后端地址）
+  // 优先使用 BACKEND_PUBLIC_URL；未配置时回退到 NEXT_PUBLIC_BASE_URL（仅在前后端同域时有效）
+  const backendUrl = process.env.BACKEND_PUBLIC_URL || frontendUrl;
+  if (!pid || !key || !frontendUrl) {
     throw new Error("支付配置缺失：请检查 ZPAY_PID、ZPAY_KEY、NEXT_PUBLIC_BASE_URL 环境变量");
   }
-  return { pid, key, baseUrl };
+  return { pid, key, frontendUrl, backendUrl };
 }
 
 // ────────────────────────────────────────────────────────
@@ -36,7 +40,7 @@ router.post("/providers/zpay/url", async (req, res) => {
       return res.status(400).json({ success: false, error: "pay_type 仅支持 alipay 或 wxpay" });
     }
 
-    const { pid, key, baseUrl } = getZpayConfig();
+    const { pid, key, frontendUrl, backendUrl } = getZpayConfig();
 
     // 1. 生成唯一订单号
     const out_trade_no = generateOrderNo();
@@ -62,8 +66,10 @@ router.post("/providers/zpay/url", async (req, res) => {
       name: PRODUCT_NAME,
       money: ORDER_AMOUNT,
       out_trade_no,
-      notify_url: `${baseUrl}/api/checkout/providers/zpay/webhook`,
-      return_url: `${baseUrl}`,   // zpay 不支持带参数，支付完成后跳回首页
+      // notify_url 必须是 zpay 服务器能访问的公网地址（生产环境用真实后端 URL）
+      notify_url: `${backendUrl}/api/checkout/providers/zpay/webhook`,
+      // return_url 是用户支付完成后浏览器跳回的前端页面地址
+      return_url: `${frontendUrl}`,
       type: pay_type,
     };
 
@@ -198,6 +204,89 @@ router.get("/providers/zpay/status", async (req, res) => {
     });
   } catch (err) {
     console.error("[zpay/status] error:", err?.message || err);
+    return res.status(500).json({ success: false, error: err?.message || "服务器错误" });
+  }
+});
+
+// ────────────────────────────────────────────────────────
+// POST /api/checkout/providers/zpay/confirm-return
+// 前端将 zpay return_url 参数发给后端，由后端验签并更新订单状态
+// 解决 localhost 开发环境 notify_url 无法被 zpay 访问的问题
+// Body: { pid, trade_no, out_trade_no, type, name, money, trade_status, sign, sign_type, ... }
+// ────────────────────────────────────────────────────────
+router.post("/providers/zpay/confirm-return", async (req, res) => {
+  try {
+    const params = req.body;
+    const { money, out_trade_no, trade_no, trade_status, type } = params;
+
+    const key = process.env.ZPAY_KEY;
+    if (!key) {
+      return res.status(500).json({ success: false, error: "ZPAY_KEY 未配置" });
+    }
+
+    // ── 安全校验 1：验证签名防止伪造 ──────────────────────
+    if (!verifySign(params, key)) {
+      console.warn("[zpay/confirm-return] ❌ 签名验证失败", { out_trade_no });
+      return res.status(400).json({ success: false, error: "签名验证失败" });
+    }
+
+    // ── 只处理支付成功状态 ──────────────────────────────
+    if (trade_status !== "TRADE_SUCCESS") {
+      return res.status(400).json({ success: false, error: `支付状态异常：${trade_status}` });
+    }
+
+    const supabase = createServerAdminClient();
+
+    // ── 查询订单 ────────────────────────────────────────
+    const { data: order, error: queryError } = await supabase
+      .from("zpay_transactions")
+      .select("*")
+      .eq("out_trade_no", out_trade_no)
+      .single();
+
+    if (queryError || !order) {
+      console.warn("[zpay/confirm-return] 订单不存在", { out_trade_no });
+      return res.status(404).json({ success: false, error: "订单不存在" });
+    }
+
+    // ── 幂等：已是 paid 或 analyzed 直接返回成功 ────────
+    if (order.status === "paid" || order.status === "analyzed") {
+      console.log("[zpay/confirm-return] 订单已处理，跳过", { out_trade_no, status: order.status });
+      return res.json({ success: true, status: order.status });
+    }
+
+    // ── 安全校验 2：金额一致性校验 ─────────────────────
+    if (parseFloat(money) !== parseFloat(order.amount)) {
+      console.error("[zpay/confirm-return] ❌ 金额不匹配", {
+        received: money,
+        expected: order.amount,
+        out_trade_no,
+      });
+      return res.status(400).json({ success: false, error: "金额不匹配，疑似伪造通知" });
+    }
+
+    // ── 条件更新：pending → paid（乐观锁防并发重入）─────
+    const { error: updateError } = await supabase
+      .from("zpay_transactions")
+      .update({
+        status: "paid",
+        trade_no: trade_no || order.trade_no,
+        trade_status,
+        pay_type: type,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("out_trade_no", out_trade_no)
+      .eq("status", "pending");
+
+    if (updateError) {
+      console.error("[zpay/confirm-return] 更新订单失败", updateError);
+      return res.status(500).json({ success: false, error: "服务器错误，请稍后重试" });
+    }
+
+    console.log(`[zpay/confirm-return] ✅ 支付确认 out_trade_no=${out_trade_no} trade_no=${trade_no}`);
+    return res.json({ success: true, status: "paid" });
+  } catch (err) {
+    console.error("[zpay/confirm-return] error:", err?.message || err);
     return res.status(500).json({ success: false, error: err?.message || "服务器错误" });
   }
 });

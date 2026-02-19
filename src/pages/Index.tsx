@@ -166,6 +166,14 @@ export default function Index() {
 
       setOutTradeNo(json.out_trade_no);
 
+      // ★ 支付前把图片和订单号存入 sessionStorage，防止跳转后状态丢失（移动端弹窗被拦截时页面会刷新）
+      try {
+        sessionStorage.setItem("yanjiuyuan_trade", json.out_trade_no);
+        sessionStorage.setItem("yanjiuyuan_image", previewUrl);
+      } catch {
+        // sessionStorage 容量不足（图片过大）时忽略，依赖新窗口模式
+      }
+
       // 在新窗口打开支付页面，原窗口图片状态保留
       window.open(json.url, "_blank", "noopener,noreferrer");
 
@@ -176,6 +184,58 @@ export default function Index() {
       setAppState("uploaded");
     }
   };
+
+  // ── 检测 zpay return_url 回跳参数（页面首次加载时执行）───
+  // 解决：移动端 window.open 被拦截后，支付完成跳回本页面时 React 状态已重置的问题
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlTradeNo = urlParams.get("out_trade_no");
+    const urlTradeStatus = urlParams.get("trade_status");
+
+    if (!urlTradeNo || urlTradeStatus !== "TRADE_SUCCESS") return;
+
+    // 清理 URL，避免刷新后重复触发
+    window.history.replaceState({}, "", "/");
+
+    // 从 sessionStorage 恢复图片和订单号
+    const savedTradeNo = sessionStorage.getItem("yanjiuyuan_trade");
+    const savedImage = sessionStorage.getItem("yanjiuyuan_image");
+    sessionStorage.removeItem("yanjiuyuan_trade");
+    sessionStorage.removeItem("yanjiuyuan_image");
+
+    if (savedTradeNo !== urlTradeNo || !savedImage) {
+      // 图片未保存（超出 sessionStorage 限制），提示用户重新上传
+      setErrorMsg(
+        `支付成功（订单 ${urlTradeNo}）！请重新上传照片即可开始分析，无需再次付款。`
+      );
+      setOutTradeNo(urlTradeNo);
+      return;
+    }
+
+    // 恢复图片并进入分析状态
+    setPreviewUrl(savedImage);
+    setOutTradeNo(urlTradeNo);
+
+    // 将 return_url 所有参数发给后端验签并更新订单状态，再触发 AI 分析
+    const returnParams: Record<string, string> = {};
+    urlParams.forEach((v, k) => { returnParams[k] = v; });
+
+    (async () => {
+      try {
+        setAppState("analyzing");
+        await fetch("/api/checkout/providers/zpay/confirm-return", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(returnParams),
+        });
+        await runAnalysis(urlTradeNo, savedImage);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : "分析失败，请稍后重试";
+        setErrorMsg(msg);
+        setAppState("uploaded");
+      }
+    })();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── 轮询支付状态（等待 zpay webhook 回调后更新）──────────
   useEffect(() => {
@@ -204,10 +264,39 @@ export default function Index() {
   }, [appState, outTradeNo, previewUrl, runAnalysis]);
 
   // ── 手动确认支付（用户已在新窗口支付但轮询未检测到时）──
-  const handleConfirmPaid = () => {
-    if (outTradeNo && previewUrl) {
-      runAnalysis(outTradeNo, previewUrl);
+  const handleConfirmPaid = async () => {
+    // 优先使用 React state；若页面刷新导致 state 丢失则从 sessionStorage 恢复
+    const tradeNo = outTradeNo || sessionStorage.getItem("yanjiuyuan_trade");
+    const imageUrl = previewUrl || sessionStorage.getItem("yanjiuyuan_image");
+
+    if (!tradeNo || !imageUrl) return;
+
+    setAppState("analyzing");
+
+    // 若 URL 中带有 zpay 回跳参数（移动端同窗口跳回场景），先发给后端验签确认支付
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get("out_trade_no") === tradeNo && urlParams.get("trade_status") === "TRADE_SUCCESS") {
+      const returnParams: Record<string, string> = {};
+      urlParams.forEach((v, k) => { returnParams[k] = v; });
+      try {
+        await fetch("/api/checkout/providers/zpay/confirm-return", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(returnParams),
+        });
+      } catch {
+        // 验签失败不阻断，后端 /api/analyze 自身也会校验订单状态
+      }
     }
+
+    // 恢复图片显示（应对 previewUrl 为 null 的情况）
+    if (!previewUrl && imageUrl) setPreviewUrl(imageUrl);
+
+    // 清理 sessionStorage
+    sessionStorage.removeItem("yanjiuyuan_trade");
+    sessionStorage.removeItem("yanjiuyuan_image");
+
+    await runAnalysis(tradeNo, imageUrl);
   };
 
   // ── 重置 ────────────────────────────────────────────────
