@@ -1,13 +1,22 @@
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
+import checkoutRouter from "./routes/checkout.mjs";
+import { createServerAdminClient } from "./lib/supabase.mjs";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// ── 是否启用支付验证（仅在 Supabase + Zpay 完整配置时生效）──
+const PAYMENT_REQUIRED =
+  !!(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.ZPAY_PID);
+
 // ── 中间件 ──────────────────────────────────────────────
 app.use(cors());
 app.use(express.json({ limit: "20mb" })); // 支持大 base64 图片
+
+// ── 挂载支付路由 ─────────────────────────────────────────
+app.use("/api/checkout", checkoutRouter);
 
 // ── OpenAI / Qwen-VL 懒加载（避免启动时因缺少 Key 而崩溃）──
 function getOpenAIClient() {
@@ -34,22 +43,63 @@ const SYSTEM_PROMPT = `你是一位专业的颜值分析与历史名人匹配 AI
 }`;
 
 // ── POST /api/analyze ───────────────────────────────────
+// Body: { image: string (base64 data URL), out_trade_no?: string }
 app.post("/api/analyze", async (req, res) => {
   try {
-    const { image } = req.body;
+    const { image, out_trade_no } = req.body;
 
     if (!image) {
       return res.status(400).json({ success: false, error: "缺少 image 字段" });
     }
 
-    // 支持 data URL（data:image/jpeg;base64,...）或纯 base64
+    // ── 支付验证（已配置 Supabase + Zpay 时强制校验）──────
+    if (PAYMENT_REQUIRED) {
+      if (!out_trade_no) {
+        return res.status(402).json({ success: false, error: "请先完成支付后再进行分析" });
+      }
+
+      const supabase = createServerAdminClient();
+
+      // 查询订单
+      const { data: order, error: queryError } = await supabase
+        .from("zpay_transactions")
+        .select("status, amount, uid")
+        .eq("out_trade_no", out_trade_no)
+        .single();
+
+      if (queryError || !order) {
+        return res.status(404).json({ success: false, error: "订单不存在，请重新支付" });
+      }
+
+      if (order.status === "analyzed") {
+        return res.status(409).json({ success: false, error: "该订单已使用，每次支付仅可分析一次" });
+      }
+
+      if (order.status !== "paid") {
+        return res.status(402).json({ success: false, error: "订单尚未完成支付，请先支付 ¥0.50" });
+      }
+
+      // 原子更新：将状态从 paid → analyzed，防止并发重复调用
+      const { error: updateError } = await supabase
+        .from("zpay_transactions")
+        .update({ status: "analyzed", updated_at: new Date().toISOString() })
+        .eq("out_trade_no", out_trade_no)
+        .eq("status", "paid"); // 用状态做乐观锁
+
+      if (updateError) {
+        console.error("[analyze] 更新订单状态失败", updateError);
+        return res.status(500).json({ success: false, error: "服务器错误，请稍后重试" });
+      }
+    }
+
+    // ── 支持 data URL 或纯 base64 ──────────────────────────
     const imageUrl = image.startsWith("data:")
       ? image
       : `data:image/jpeg;base64,${image}`;
 
     const openai = getOpenAIClient();
 
-    // 用 AbortController 实现 60 秒超时保护
+    // ── 60 秒超时保护 ──────────────────────────────────────
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 60_000);
 
@@ -68,7 +118,6 @@ app.post("/api/analyze", async (req, res) => {
               content: [
                 {
                   type: "text",
-                  // 明确要求 JSON，不依赖 response_format（Qwen VL 不稳定支持）
                   text: "请分析这张照片，返回颜值评分和最相似的中国历史名人。只输出纯 JSON，不要包含任何 markdown 代码块或额外文字。",
                 },
                 {
@@ -88,12 +137,11 @@ app.post("/api/analyze", async (req, res) => {
 
     const raw = response.choices[0]?.message?.content ?? "";
 
-    // 解析 JSON
+    // ── 解析 JSON，含正则兜底 ──────────────────────────────
     let result;
     try {
       result = JSON.parse(raw);
     } catch {
-      // 尝试从返回文本中提取 JSON
       const match = raw.match(/\{[\s\S]*\}/);
       if (match) {
         result = JSON.parse(match[0]);
@@ -102,7 +150,7 @@ app.post("/api/analyze", async (req, res) => {
       }
     }
 
-    // 字段校验与兜底
+    // ── 字段校验与兜底 ─────────────────────────────────────
     const safeResult = {
       score: Number(result.score) || 80,
       celebrity: String(result.celebrity || "历史名人"),
@@ -124,9 +172,14 @@ app.post("/api/analyze", async (req, res) => {
 
 // ── 健康检查 ────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", time: new Date().toISOString() });
+  res.json({
+    status: "ok",
+    time: new Date().toISOString(),
+    payment_required: PAYMENT_REQUIRED,
+  });
 });
 
 app.listen(PORT, () => {
   console.log(`✅ 颜究院后端服务已启动：http://localhost:${PORT}`);
+  console.log(`   支付验证：${PAYMENT_REQUIRED ? "✅ 已启用" : "⚠️  未配置（开发模式，跳过支付验证）"}`);
 });

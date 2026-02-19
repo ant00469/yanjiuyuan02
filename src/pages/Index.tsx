@@ -1,7 +1,14 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import heroBg from "@/assets/hero-bg.jpg";
 
-type AppState = "idle" | "uploaded" | "paying" | "analyzing" | "result";
+// ── 类型定义 ─────────────────────────────────────────────
+type AppState =
+  | "idle"             // 初始状态
+  | "uploaded"         // 已上传照片
+  | "paying"           // 正在获取支付链接
+  | "waiting_payment"  // 等待用户在新窗口完成支付
+  | "analyzing"        // 调用 AI 分析中
+  | "result";          // 显示分析结果
 
 interface AnalysisResult {
   score: number;
@@ -11,12 +18,24 @@ interface AnalysisResult {
   dynasty: string;
 }
 
+// ── 工具：获取或创建匿名用户 UID（存入 localStorage）────────
+function getOrCreateUid(): string {
+  let uid = localStorage.getItem("yanjiuyuan_uid");
+  if (!uid) {
+    uid = window.crypto.randomUUID();
+    localStorage.setItem("yanjiuyuan_uid", uid);
+  }
+  return uid;
+}
+
+// ── 功能卡片数据 ─────────────────────────────────────────
 const FEATURE_CARDS = [
   { icon: "✦", title: "AI颜值评分", desc: "基于五官比例、面部对称性综合评分" },
   { icon: "⚡", title: "历史名人匹配", desc: "找出与你最相似的历史名人" },
   { icon: "◈", title: "趣味颜值报告", desc: "生成专属档案，一键分享朋友圈" },
 ];
 
+// ── 组件：星级评分 ────────────────────────────────────────
 function StarRating({ score }: { score: number }) {
   const fullStars = Math.floor(score / 20);
   const hasHalf = score % 20 >= 10;
@@ -42,6 +61,7 @@ function StarRating({ score }: { score: number }) {
   );
 }
 
+// ── 组件：分数圆环 ────────────────────────────────────────
 function ScoreCircle({ score }: { score: number }) {
   const circumference = 2 * Math.PI * 54;
   const strokeDash = (score / 100) * circumference;
@@ -70,14 +90,18 @@ function ScoreCircle({ score }: { score: number }) {
   );
 }
 
+// ── 主页面组件 ────────────────────────────────────────────
 export default function Index() {
   const [appState, setAppState] = useState<AppState>("idle");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
+  const [outTradeNo, setOutTradeNo] = useState<string | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
 
+  // ── 文件选择处理 ────────────────────────────────────────
   const handleFileSelect = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) {
       setErrorMsg("请上传图片文件（JPG/PNG）");
@@ -103,22 +127,17 @@ export default function Index() {
     e.target.value = "";
   };
 
-  const handlePayAndAnalyze = async () => {
-    if (!previewUrl) return;
-    setErrorMsg("");
-    setAppState("paying");
-    await new Promise((r) => setTimeout(r, 800));
+  // ── AI 分析（支付验证通过后调用）──────────────────────────
+  const runAnalysis = useCallback(async (tradeNo: string, imageUrl: string) => {
     setAppState("analyzing");
     try {
-      const response = await fetch("/api/analyze", {
+      const resp = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image: previewUrl }),
+        body: JSON.stringify({ image: imageUrl, out_trade_no: tradeNo }),
       });
-      const json = await response.json();
-      if (!response.ok || !json.success) {
-        throw new Error(json.error || "分析失败，请稍后重试");
-      }
+      const json = await resp.json();
+      if (!json.success) throw new Error(json.error || "分析失败，请稍后重试");
       setResult(json.data as AnalysisResult);
       setAppState("result");
     } catch (err: unknown) {
@@ -126,18 +145,85 @@ export default function Index() {
       setErrorMsg(msg);
       setAppState("uploaded");
     }
+  }, []);
+
+  // ── 支付流程：获取支付链接，新窗口打开，开始轮询 ─────────
+  const handlePayAndAnalyze = async () => {
+    if (!previewUrl) return;
+    setErrorMsg("");
+    setAppState("paying");
+
+    try {
+      const uid = getOrCreateUid();
+
+      const resp = await fetch("/api/checkout/providers/zpay/url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ uid, pay_type: "alipay" }),
+      });
+      const json = await resp.json();
+      if (!json.success) throw new Error(json.error || "获取支付链接失败");
+
+      setOutTradeNo(json.out_trade_no);
+
+      // 在新窗口打开支付页面，原窗口图片状态保留
+      window.open(json.url, "_blank", "noopener,noreferrer");
+
+      setAppState("waiting_payment");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "获取支付链接失败，请稍后重试";
+      setErrorMsg(msg);
+      setAppState("uploaded");
+    }
   };
 
+  // ── 轮询支付状态（等待 zpay webhook 回调后更新）──────────
+  useEffect(() => {
+    if (appState !== "waiting_payment" || !outTradeNo || !previewUrl) return;
+
+    // 捕获当前值，避免闭包过期问题
+    const capturedTradeNo = outTradeNo;
+    const capturedImageUrl = previewUrl;
+
+    const intervalId = setInterval(async () => {
+      try {
+        const resp = await fetch(
+          `/api/checkout/providers/zpay/status?out_trade_no=${capturedTradeNo}`
+        );
+        const json = await resp.json();
+        if (json.success && (json.status === "paid" || json.status === "analyzed")) {
+          clearInterval(intervalId);
+          runAnalysis(capturedTradeNo, capturedImageUrl);
+        }
+      } catch {
+        // 网络抖动时忽略，继续轮询
+      }
+    }, 3000); // 每 3 秒轮询一次
+
+    return () => clearInterval(intervalId);
+  }, [appState, outTradeNo, previewUrl, runAnalysis]);
+
+  // ── 手动确认支付（用户已在新窗口支付但轮询未检测到时）──
+  const handleConfirmPaid = () => {
+    if (outTradeNo && previewUrl) {
+      runAnalysis(outTradeNo, previewUrl);
+    }
+  };
+
+  // ── 重置 ────────────────────────────────────────────────
   const handleReset = () => {
     setAppState("idle");
     setPreviewUrl(null);
     setResult(null);
     setErrorMsg("");
+    setOutTradeNo(null);
   };
 
+  // ── 派生状态 ─────────────────────────────────────────────
   const isPaying = appState === "paying";
+  const isWaitingPayment = appState === "waiting_payment";
   const isAnalyzing = appState === "analyzing";
-  const isBusy = isPaying || isAnalyzing;
+  const isBusy = isPaying || isWaitingPayment || isAnalyzing;
   const showResult = appState === "result" && result !== null;
   const hasPhoto = previewUrl !== null;
 
@@ -227,13 +313,15 @@ export default function Index() {
           {previewUrl ? (
             <div className="relative rounded-xl overflow-hidden" style={{ aspectRatio: "1", background: "hsl(var(--muted))" }}>
               <img src={previewUrl} alt="预览" className="w-full h-full object-cover" />
-              <button
-                onClick={handleReset}
-                className="absolute top-3 right-3 w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold transition-opacity hover:opacity-90"
-                style={{ background: "hsl(0 0% 0% / 0.5)", color: "white" }}
-              >
-                ✕
-              </button>
+              {!isBusy && (
+                <button
+                  onClick={handleReset}
+                  className="absolute top-3 right-3 w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold transition-opacity hover:opacity-90"
+                  style={{ background: "hsl(0 0% 0% / 0.5)", color: "white" }}
+                >
+                  ✕
+                </button>
+              )}
               {showResult && (
                 <div
                   className="absolute bottom-0 left-0 right-0 py-2 text-center text-xs font-medium"
@@ -313,12 +401,17 @@ export default function Index() {
             {isPaying ? (
               <span className="flex items-center justify-center gap-2">
                 <span className="w-4 h-4 rounded-full border-2 border-current border-t-transparent animate-spin" />
-                支付中...
+                正在生成支付链接...
+              </span>
+            ) : isWaitingPayment ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="w-4 h-4 rounded-full border-2 border-current border-t-transparent animate-spin" />
+                等待支付完成...
               </span>
             ) : isAnalyzing ? (
               <span className="flex items-center justify-center gap-2">
                 <span className="w-4 h-4 rounded-full border-2 border-current border-t-transparent animate-spin" />
-                AI分析中，请稍候...
+                AI 分析中，请稍候...
               </span>
             ) : showResult ? (
               "✓ 分析完成"
@@ -328,7 +421,39 @@ export default function Index() {
               "¥ 0.5  立即测颜值"
             )}
           </button>
-          {!showResult && (
+
+          {/* 等待支付时的提示与手动确认按钮 */}
+          {isWaitingPayment && (
+            <div className="mt-3 space-y-2">
+              <p className="text-center text-xs" style={{ color: "hsl(var(--muted-foreground))" }}>
+                💳 请在新窗口完成支付，完成后自动开始分析
+              </p>
+              <button
+                className="w-full py-2 rounded-xl text-xs font-medium border transition-all hover:shadow-sm active:scale-95"
+                style={{
+                  borderColor: "hsl(var(--crimson) / 0.4)",
+                  color: "hsl(var(--crimson))",
+                  background: "hsl(var(--crimson) / 0.05)",
+                }}
+                onClick={handleConfirmPaid}
+              >
+                我已完成支付，立即分析 →
+              </button>
+              <button
+                className="w-full py-2 rounded-xl text-xs font-medium border transition-all hover:shadow-sm active:scale-95"
+                style={{
+                  borderColor: "hsl(var(--border))",
+                  color: "hsl(var(--muted-foreground))",
+                  background: "transparent",
+                }}
+                onClick={handleReset}
+              >
+                取消支付
+              </button>
+            </div>
+          )}
+
+          {!showResult && !isWaitingPayment && (
             <p className="text-center text-xs mt-2" style={{ color: "hsl(var(--muted-foreground))" }}>
               仅需0.5元 · 安全支付 · 即时出结果
             </p>
