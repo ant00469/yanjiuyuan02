@@ -11,15 +11,6 @@ interface AnalysisResult {
   dynasty: string;
 }
 
-const MOCK_RESULTS: AnalysisResult[] = [
-  { score: 87, celebrity: "王昭君", similarity: 82, description: "汉朝四大美女之一，以和亲出塞闻名。", dynasty: "西汉" },
-  { score: 91, celebrity: "李白", similarity: 75, description: "唐代伟大浪漫主义诗人，诗仙之称。", dynasty: "唐代" },
-  { score: 83, celebrity: "武则天", similarity: 78, description: "中国历史上唯一的正统女皇帝。", dynasty: "唐代" },
-  { score: 79, celebrity: "曹操", similarity: 70, description: "东汉末年政治家、军事家、文学家。", dynasty: "三国" },
-  { score: 88, celebrity: "貂蝉", similarity: 85, description: "三国四大美女之一，以美貌倾国。", dynasty: "东汉" },
-  { score: 76, celebrity: "诸葛亮", similarity: 73, description: "三国时期蜀汉丞相，智慧化身。", dynasty: "三国" },
-];
-
 const FEATURE_CARDS = [
   { icon: "✦", title: "AI颜值评分", desc: "基于五官比例、面部对称性综合评分" },
   { icon: "⚡", title: "历史名人匹配", desc: "找出与你最相似的历史名人" },
@@ -113,13 +104,28 @@ export default function Index() {
   };
 
   const handlePayAndAnalyze = async () => {
+    if (!previewUrl) return;
+    setErrorMsg("");
     setAppState("paying");
-    await new Promise((r) => setTimeout(r, 1200));
+    await new Promise((r) => setTimeout(r, 800));
     setAppState("analyzing");
-    await new Promise((r) => setTimeout(r, 2000));
-    const mockResult = MOCK_RESULTS[Math.floor(Math.random() * MOCK_RESULTS.length)];
-    setResult(mockResult);
-    setAppState("result");
+    try {
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image: previewUrl }),
+      });
+      const json = await response.json();
+      if (!response.ok || !json.success) {
+        throw new Error(json.error || "分析失败，请稍后重试");
+      }
+      setResult(json.data as AnalysisResult);
+      setAppState("result");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "网络错误，请稍后重试";
+      setErrorMsg(msg);
+      setAppState("uploaded");
+    }
   };
 
   const handleReset = () => {
@@ -131,6 +137,7 @@ export default function Index() {
 
   const isPaying = appState === "paying";
   const isAnalyzing = appState === "analyzing";
+  const isBusy = isPaying || isAnalyzing;
   const showResult = appState === "result" && result !== null;
   const hasPhoto = previewUrl !== null;
 
@@ -300,7 +307,7 @@ export default function Index() {
         <div>
           <button
             className="btn-brand w-full py-4 rounded-2xl text-base font-bold tracking-wide transition-all active:scale-95"
-            disabled={!hasPhoto || isPaying || isAnalyzing || showResult}
+            disabled={!hasPhoto || isBusy || showResult}
             onClick={handlePayAndAnalyze}
           >
             {isPaying ? (
