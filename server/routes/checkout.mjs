@@ -80,7 +80,16 @@ router.post("/providers/zpay/url", async (req, res) => {
 
     console.log(`[zpay/url] 创建订单 ${out_trade_no} uid=${uid} amount=${ORDER_AMOUNT}`);
 
-    return res.json({ success: true, url: payUrl, out_trade_no });
+    return res.json({
+      success: true,
+      url: payUrl,
+      out_trade_no,
+      // 帮助排查线上“支付后跳转 404”的问题（不含敏感信息）
+      meta: {
+        notify_url: params.notify_url,
+        return_url: params.return_url,
+      },
+    });
   } catch (err) {
     console.error("[zpay/url] error:", err?.message || err);
     return res.status(500).json({ success: false, error: err?.message || "服务器错误" });
