@@ -403,13 +403,13 @@ export default function Index() {
             <div className="relative rounded-xl overflow-hidden" style={{ aspectRatio: "1", background: "hsl(var(--muted))" }}>
               <img src={previewUrl} alt="预览" className="w-full h-full object-cover" />
               {!isBusy && (
-                <button
-                  onClick={handleReset}
-                  className="absolute top-3 right-3 w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold transition-opacity hover:opacity-90"
-                  style={{ background: "hsl(0 0% 0% / 0.5)", color: "white" }}
-                >
-                  ✕
-                </button>
+              <button
+                onClick={handleReset}
+                className="absolute top-3 right-3 w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold transition-opacity hover:opacity-90"
+                style={{ background: "hsl(0 0% 0% / 0.5)", color: "white" }}
+              >
+                ✕
+              </button>
               )}
               {showResult && (
                 <div
