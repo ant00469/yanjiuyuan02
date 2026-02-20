@@ -136,8 +136,16 @@ export default function Index() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image: imageUrl, out_trade_no: tradeNo }),
       });
-      const json = await resp.json();
-      if (!json.success) throw new Error(json.error || "分析失败，请稍后重试");
+
+      // 兼容：当接口返回 HTML（例如 404 页面）时，避免出现 “Unexpected token 'T' …” 这种误导错误
+      const contentType = resp.headers.get("content-type") || "";
+      const json = contentType.includes("application/json")
+        ? await resp.json()
+        : { success: false, error: (await resp.text()).slice(0, 200) };
+
+      if (!resp.ok || !json.success) {
+        throw new Error(json.error || `分析失败（HTTP ${resp.status}）`);
+      }
       setResult(json.data as AnalysisResult);
       setAppState("result");
     } catch (err: unknown) {
@@ -161,8 +169,14 @@ export default function Index() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ uid, pay_type: "alipay" }),
       });
-      const json = await resp.json();
-      if (!json.success) throw new Error(json.error || "获取支付链接失败");
+      const contentType = resp.headers.get("content-type") || "";
+      const json = contentType.includes("application/json")
+        ? await resp.json()
+        : { success: false, error: (await resp.text()).slice(0, 200) };
+
+      if (!resp.ok || !json.success) {
+        throw new Error(json.error || `获取支付链接失败（HTTP ${resp.status}）`);
+      }
 
       setOutTradeNo(json.out_trade_no);
 
@@ -250,7 +264,10 @@ export default function Index() {
         const resp = await fetch(
           `/api/checkout/providers/zpay/status?out_trade_no=${capturedTradeNo}`
         );
-        const json = await resp.json();
+        const contentType = resp.headers.get("content-type") || "";
+        const json = contentType.includes("application/json")
+          ? await resp.json()
+          : { success: false };
         if (json.success && (json.status === "paid" || json.status === "analyzed")) {
           clearInterval(intervalId);
           runAnalysis(capturedTradeNo, capturedImageUrl);
